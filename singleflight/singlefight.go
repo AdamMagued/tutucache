@@ -1,8 +1,11 @@
 package singleflight
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
-//同一个 key 大量并发请求同时缓存 miss 时，只放行 1 个协程去回源查询数据库，剩下所有并发协程阻塞等待，复用这一次查询结果，避免大量请求同时打到底层 DB。
+// 同一个 key 大量并发请求同时缓存 miss 时，只放行 1 个协程去回源查询数据库，剩下所有并发协程阻塞等待，复用这一次查询结果，避免大量请求同时打到底层 DB。
 // call：代表一次【正在执行 / 已经执行完成】的请求
 type call struct {
 	wg  sync.WaitGroup // 等待组，让其他协程阻塞等待请求结束
@@ -23,8 +26,8 @@ func NewGroup() *Group {
 	}
 }
 
-//针对相同key， 无论Do被调用多少次， 函数fn都只会被调用一次
-//等fn调用结束了， 返回返回值或者err
+// 针对相同key， 无论Do被调用多少次， 函数fn都只会被调用一次
+// 等fn调用结束了， 返回返回值或者err
 func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
 	g.mu.Lock()
 	// 兜底懒加载（防止忘记调用NewGroup）
@@ -44,14 +47,35 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, err
 	g.m[key] = c
 	g.mu.Unlock()
 
-	c.val, c.err = fn()
-	c.wg.Done() //请求结束
-
-	g.mu.Lock()
-	delete(g.m, key)
-	g.mu.Unlock()
-
+	g.doCall(c, key, fn)
 	return c.val, c.err
+}
+
+// doCall 执行 fn，并保证无论正常返回还是 panic，都会删除 key 并唤醒所有等待者。
+func (g *Group) doCall(c *call, key string, fn func() (interface{}, error)) {
+	defer func() {
+		// recover 必须直接在 defer 中调用才能捕获 panic。
+		r := recover()
+		if r != nil {
+			// 给等待者一个明确的错误，避免它们拿到 (nil, nil) 误以为成功。
+			c.err = fmt.Errorf("singleflight: fn panicked: %v", r)
+		}
+
+		// 先删除 key 再 Done：新的 Do(key) 会创建新的 call，
+		// 不会拿到这个已经结束（或已 panic）的 call。
+		g.mu.Lock()
+		delete(g.m, key)
+		g.mu.Unlock()
+
+		c.wg.Done() // 唤醒所有阻塞在 c.wait() 的调用方
+
+		// 清理完成后再把 panic 抛给执行 fn 的调用方。
+		if r != nil {
+			panic(r)
+		}
+	}()
+
+	c.val, c.err = fn()
 }
 
 func (c *call) wait() (interface{}, error) {
