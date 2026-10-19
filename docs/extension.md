@@ -341,15 +341,16 @@ const (
 
 // 在 getFromPeer 中接入熔断
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
-    // 检查熔断状态
-    if breaker.IsOpen() {
+    // 申请准入；失败表示熔断中
+    ticket, ok := breaker.Allow()
+    if !ok {
         return ByteView{}, ErrCircuitOpen  // 快速失败，降级到本地
     }
     // ... 原有请求逻辑 ...
     if err != nil {
-        breaker.RecordFailure()
+        breaker.RecordFailure(ticket)
     } else {
-        breaker.RecordSuccess()
+        breaker.RecordSuccess(ticket)
     }
 }
 ```

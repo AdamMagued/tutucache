@@ -13,10 +13,10 @@ Group.Get(key)
         └─ fn 内部：
              ├─ 有 peers？→ 一致性哈希 PickPeer(key) 选远程节点
              │     └─ getFromPeer(peer)
-             │           ├─ 熔断器打开？→ 快速失败（ErrCircuitOpen）
+             │           ├─ Allow() 拒绝？→ 快速失败（ErrCircuitOpen）
              │           ├─ peer.Get(req, res) 远程取
-             │           │     ├─ 成功 → RecordSuccess + RecordPeerLoad → 返回
-             │           │     └─ 失败 → RecordFailure → 降级
+             │           │     ├─ 成功 → RecordSuccess(ticket) + RecordPeerLoad → 返回
+             │           │     └─ 失败 → RecordFailure(ticket) → 降级
              │           └─ 降级 → getLocal(key)
              └─ 本地 key / 远程失败 → getLocal(key)
                    └─ getter.Get(key) 回源 → cloneBytes 深拷贝 → populateCache 写回

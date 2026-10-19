@@ -30,9 +30,9 @@
                           └─────────────┬──────────────┘
                                         │ 是
                                         ▼
-                          getFromPeer(peer)            ← breaker.IsOpen()? 熔断→快速失败
+                          getFromPeer(peer)            ← breaker.Allow()? 熔断→快速失败
                           ┌─────────────┴──────────────┐
-                          │  peer.Get(req, res) 成功？  │── 成功 → RecordSuccess + RecordPeerLoad → 返回
+                          │  peer.Get(req, res) 成功？  │── 成功 → RecordSuccess(ticket) + RecordPeerLoad → 返回
                           └─────────────┬──────────────┘
                                         │ 失败（含熔断 / 本地 key）
                                         ▼
@@ -296,16 +296,19 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 
 - 状态机三态：`Closed`（正常放行）、`Open`（熔断，快速失败）、`HalfOpen`（放行一个探测请求）。
 - `NewCircuitBreaker(3, 10*time.Second)`：**连续失败 3 次熔断，10 秒后尝试恢复**。
-- `IsOpen()`：
-  - Closed → false（放行）。
-  - Open → 若 `time.Since(lastFailure) > timeout` 则切到 HalfOpen 并返回 false（放行一个探测），否则返回 true（拒绝）。
-  - HalfOpen → false（放行探测）。
-- `RecordSuccess()`：直接复位 `Closed` + 清零计数。
-- `RecordFailure()`：`failureCount++` 记 `lastFailure`；当 `failureCount >= threshold` **或当前是 HalfOpen** 时，切 `Open`。
+- `Allow() (Ticket, bool)`：
+  - Closed → 放行，返回当前 generation 的 ticket。
+  - Open → 若冷却已到，原子地切到 HalfOpen、`generation++` 并预约唯一探测名额，返回探测 ticket；否则拒绝。
+  - HalfOpen → 探测名额已被占用，拒绝其他请求。
+- `RecordSuccess(ticket)` / `RecordFailure(ticket)`：
+  - 先校验 `ticket.generation == 当前 generation`，不匹配（迟到的旧结果）直接返回，不修改任何状态。
+  - Closed 下成功清零计数、失败计数 +1，达到阈值切 Open。
+  - HalfOpen 下只有预约的探测结果有效：成功 → Closed，失败 → Open 并重新计算冷却起点。
+- `generation`（状态代数，每次状态迁移 +1）和 `probeInFlight`（半开探测名额）是两个独立机制：前者丢弃跨代迟到结果，后者保证半开只放行一个探测。
 
 **半开是惰性触发的**：不是定时器主动切半开，而是「有请求来且已过冷却期」才切。半开只放一个探测，探测成功→Closed，探测失败→立刻重新 Open。
 
-**降级接入点**：在 `Group.getFromPeer`。`IsOpen()` 为 true → 返回 `ErrCircuitOpen` 快速失败，上层 `load` 落到 `getLocal` 回源。远程请求成功/失败分别 `RecordSuccess`/`RecordFailure`。
+**降级接入点**：在 `Group.getFromPeer`。`Allow()` 拒绝 → 返回 `ErrCircuitOpen` 快速失败，上层 `load` 落到 `getLocal` 回源。远程请求成功/失败分别用准入时拿到的 ticket 调用 `RecordSuccess`/`RecordFailure`。
 
 **为什么这么设计**：
 - 熔断器解决「雪崩」：一个下游节点故障，如果还不断去请求，会让调用方大量 goroutine 阻塞等待超时，进而拖垮上游。熔断让故障节点快速失败、跳过远程直接本地回源。
