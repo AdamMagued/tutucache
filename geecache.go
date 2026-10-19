@@ -44,6 +44,12 @@ type Group struct {
 	DefaultTTL time.Duration
 	// breaker 远程节点熔断器，失败 N 次后跳过远程直接降级到本地
 	breaker *CircuitBreaker
+	metrics *Metrics
+}
+
+// Metrics 返回当前 Group 的指标快照
+func (g *Group) Metrics() MetricsSnapshot {
+	return g.metrics.Snapshot()
 }
 
 func (g *Group) RegisterPeers(peers PeerPicker) {
@@ -68,12 +74,14 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-
+	m := NewMetrics()
 	g := &Group{
-		name:   name,
-		getter: getter,
+		name:    name,
+		getter:  getter,
+		metrics: m,
 		mainCache: cache{
 			cacheBytes: cacheBytes,
+			metrics:    m,
 		},
 		loader:  singleflight.NewGroup(),
 		breaker: NewCircuitBreaker(3, 10*time.Second), // 连续失败3次 → 熔断10秒
@@ -97,11 +105,11 @@ func (g *Group) Get(key string) (ByteView, error) {
 	//查询本地并发LRU缓存
 	if v, ok := g.mainCache.get(key); ok {
 		log.Println("[GeeCache] hit")
-		globalMetrics.RecordHit()
+		g.metrics.RecordHit()
 		return v, nil
 	}
 	//缓存未命中， 进入加载逻辑
-	globalMetrics.RecordMiss()
+	g.metrics.RecordMiss()
 	return g.load(key)
 }
 
@@ -153,12 +161,12 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 	}
 
 	g.breaker.RecordSuccess(ticket) // 成功 → 重置熔断器
-	globalMetrics.RecordPeerLoad()
+	g.metrics.RecordPeerLoad()
 	//包装成ByteView
 	return ByteView{b: res.Value}, nil
 }
 func (g *Group) getLocal(key string) (ByteView, error) {
-	globalMetrics.RecordLocalLoad()
+	g.metrics.RecordLocalLoad()
 	//使用业务回调拉取原始数据
 	//拿到的是[]byte
 	bytes, err := g.getter.Get(key)

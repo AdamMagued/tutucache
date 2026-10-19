@@ -140,7 +140,7 @@ type entry struct {
 
 ### 1.3 cache — 并发安全封装（锁层次）
 
-**怎么实现**（`cache.go:11-15`）：`cache` 结构体持有一把 `sync.Mutex`、一个 `*lru.Cache` 指针、一个 `cacheBytes`。`add`/`get`/`StartCleanup` 全都在 `Mutex` 保护下操作 lru。lru 首次 `add` 时懒加载（`lru.New(cacheBytes, ...)`），并把淘汰回调注册成 `globalMetrics.RecordEviction()`。
+**怎么实现**（`cache.go:11-16`）：`cache` 结构体持有一把 `sync.Mutex`、一个 `*lru.Cache` 指针、一个 `cacheBytes` 和一个指向所属 Group 的 `*Metrics`。`add`/`get`/`StartCleanup` 全都在 `Mutex` 保护下操作 lru。lru 首次 `add` 时懒加载（`lru.New(cacheBytes, ...)`），并把淘汰回调注册成 `c.metrics.RecordEviction()`。
 
 **锁层次（关键）**：`cache.mu`（外层 sync.Mutex）→ `lru.Cache`（内层，**本身无锁**）。lru 的所有方法都假设外部已加锁。
 
@@ -347,10 +347,10 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 ### 1.11 指标埋点 + 健康检查 + 优雅关闭
 
 **指标埋点**（`metrics.go`）：
-- `Metrics{Hits, Misses, LocalLoads, PeerLoads, Evictions, TotalBytes}`，全部 `sync/atomic` 的 `AddInt64/LoadInt64/StoreInt64` 实现，**并发安全**。
-- 命中率 = `hits / (hits + misses)`，分母 0 返回 0。
+- 每个 `Group` 持有独立的 `Metrics`，计数命中/未命中/本地加载/远程加载/淘汰，天然按命名空间隔离。
+- 写入和 `Snapshot` 共用一把 `sync.RWMutex`：`Snapshot` 一次拷完全部字段，得到某一时刻的一致视图。
 - 埋点位置：命中/未命中在 `Get`；本地加载在 `getLocal`；远程加载在 `getFromPeer` 成功时；淘汰在 `OnEvicted` 回调。
-- 通过 `/metrics` 输出 Prometheus 文本格式。
+- `/metrics` 输出带 `group="..."` 标签的原始 `_total` 计数器；不导出 lifetime 命中率 gauge，近期命中率由 Prometheus 对计数器求 `rate()`。
 
 **健康检查**：`/health` 返回 200 + "OK"，最简存活探针（liveness），免鉴权。
 
@@ -505,12 +505,12 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 - **诚实且加分的说法**：> 「我实现了 HTTP 和 gRPC 两种传输，通过 PeerPicker/PeerGetter 接口解耦，序列化统一用 protobuf。demo 主入口当前走 HTTP，gRPC 通道我写了完整的单测和 bufconn 集成测试覆盖。之所以能这么做，正是接口解耦的好处——切通道不改核心逻辑。」
 - **要不要补**：如果想让简历 bullet 100% 硬，可以把 main 切到 gRPC（给 `GRPCPool` 补 `StartDiscovery`、`startCacheServer` 换成 `NewGRPCPool`+`Serve()`）。**属于可选的代码增强，我可以帮你做**。不改代码的话，上面这个说法也完全站得住，且显得你理解双通道设计。
 
-### 雷点 2：`TotalBytes` 指标声明了但没接线
+### 雷点 2：`cache_bytes` 指标已移除，真实内存占用尚未导出
 
-- **事实**：`metrics.go` 有 `TotalBytes` 字段和 `SetTotalBytes`，但全项目无人调用，`cache_bytes` 恒为 0。
-- **面试官可能问**：「你的 cache_bytes 指标为什么一直是 0？」
-- **诚实说法**：> 「我声明了当前内存占用这个 gauge，但还没在 LRU 增删的路径上把它和实际字节数接通，所以现在恒为 0。这是我 TODO 列表里的一条——只需要在 `cache.add`/lru 淘汰/过期时调 `SetTotalBytes` 同步 `nbytes` 就行。」
-- **怎么补**：在 lru 的 `nbytes` 变化处（Add/RemoveOldest/过期删除）回写 `metrics.SetTotalBytes`。改动很小，收益是让「内存占用」指标真实可用。
+- **事实**：原实现有 `TotalBytes` 字段和 `SetTotalBytes`，但全项目无人调用，`geecache_cache_bytes` 恒为 0。修复 #33 时已删除这个死指标及字段，避免继续输出误导性数据。
+- **面试官可能问**：「你的 /metrics 为什么没有内存占用？」
+- **诚实说法**：> 「之前有个恒为 0 的死 gauge，我把它删了。要恢复应该从 LRU 的实时状态派生：给 `lru.Cache` 加 `Bytes()`，exporter 在 `cache.mu` 保护下读取，按 group 输出，而不是单独维护一个会漂移的 atomic。」
+- **怎么补**：见 issue #11；核心是不要用独立计数器镜像 LRU 状态，而是在抓取时读 `lru.nbytes`。
 
 ### 雷点 3：后台 goroutine 没纳入优雅关闭
 
@@ -535,7 +535,7 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 
 ### 汇总：一个「我主动交代的改进清单」话术
 
-> 「如果要把这个项目生产化，我列了几个明确的改进点：① 把 gRPC 通道接进主入口并补上服务发现，让双通道都真正可用；② 把 TotalBytes 指标接线，让内存占用可观测；③ 让后台 goroutine 纳入优雅关闭生命周期；④ 熔断器从 per-group 细化到 per-peer。这些我都有清晰的改法，只是 demo 阶段优先保核心链路正确。」
+> 「如果要把这个项目生产化，我列了几个明确的改进点：① 把 gRPC 通道接进主入口并补上服务发现，让双通道都真正可用；② 按 group 导出真实的 cache bytes，让内存占用可观测；③ 让后台 goroutine 纳入优雅关闭生命周期；④ 熔断器从 per-group 细化到 per-peer。这些我都有清晰的改法，只是 demo 阶段优先保核心链路正确。」
 
 这样一段话，比「我抄了个 geecache」高好几个段位——它证明你**理解了自己代码的边界**，这正是「能读代码」和「能设计系统」之间的那道坎。
 

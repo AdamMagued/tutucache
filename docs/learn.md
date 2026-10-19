@@ -156,6 +156,7 @@ type cache struct {
     mu         sync.Mutex
     lru        *lru.Cache
     cacheBytes int64    // 最大内存，用于延迟初始化
+    metrics    *Metrics // 所属 Group 的指标实例
 }
 
 func (c *cache) add(key string, value ByteView, ttl time.Duration) {
@@ -163,7 +164,7 @@ func (c *cache) add(key string, value ByteView, ttl time.Duration) {
     defer c.mu.Unlock()
     if c.lru == nil {                    // ★ 延迟初始化
         c.lru = lru.New(c.cacheBytes, func(key string, v lru.Value) {
-            globalMetrics.RecordEviction()  // 淘汰时埋点
+            c.metrics.RecordEviction()  // 淘汰时埋点到当前 Group
         })
     }
     c.lru.Add(key, value, ttl)
@@ -287,11 +288,11 @@ func (g *Group) Get(key string) (ByteView, error) {
     }
     // 第一步：查本地缓存
     if v, ok := g.mainCache.get(key); ok {
-        globalMetrics.RecordHit()
+        g.metrics.RecordHit()
         return v, nil
     }
     // 第二步：未命中，进入加载逻辑
-    globalMetrics.RecordMiss()
+    g.metrics.RecordMiss()
     return g.load(key)
 }
 ```
@@ -656,19 +657,20 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 
 ```go
 type Metrics struct {
-    Hits       int64 // 命中次数
-    Misses     int64 // 未命中次数
-    LocalLoads int64 // 本地加载次数
-    PeerLoads  int64 // 远程加载次数
-    Evictions  int64 // 淘汰条目数
-    TotalBytes int64 // 当前占用内存
+    mu         sync.RWMutex
+    hits       int64 // 命中次数
+    misses     int64 // 未命中次数
+    localLoads int64 // 本地加载次数
+    peerLoads  int64 // 远程加载次数
+    evictions  int64 // 淘汰条目数
 }
 ```
 
-- 全部用 `sync/atomic` 的 `AddInt64` / `LoadInt64`，**并发安全、无锁**。
-- 命中率 = `hits / (hits + misses)`（分母 0 返回 0）。
+- 每个 `Group` 创建独立的 `Metrics` 实例，多个命名空间互不污染。
+- 写入和 `Snapshot` 共用一把 `sync.RWMutex`；`Snapshot` 一次拷完全部字段，**返回某一时刻的一致视图**。
+- `HitRate()` 仍存在，但语义是 lifetime ratio；`/metrics` 不导出它，近期命中率由 Prometheus 对 `_total` 计数器求 `rate()`。
 - 埋点位置：命中/未命中在 `Get`；本地加载在 `getLocal`；远程加载在 `getFromPeer` 成功时；淘汰在 LRU 的 `OnEvicted` 回调。
-- 通过 `/metrics` 端点以 Prometheus 文本格式暴露。
+- `/metrics` 输出带 `group="..."` 标签的原始计数器。
 
 ### 12.2 健康检查
 

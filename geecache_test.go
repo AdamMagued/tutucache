@@ -3,7 +3,11 @@ package geecache
 import (
 	"fmt"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -20,9 +24,6 @@ func TestGetter(t *testing.T) {
 }
 
 func TestMetrics(t *testing.T) {
-	// 保存测试前的指标，只关心增量
-	snapBefore := globalMetrics.Snapshot()
-
 	// 创建很小的缓存（10 字节），确保写入几个 key 后就触发淘汰
 	g := NewGroup("m", 10, GetterFunc(
 		func(key string) ([]byte, error) {
@@ -39,30 +40,114 @@ func TestMetrics(t *testing.T) {
 	// Get("c"): miss → local load → 写入 c（再淘汰一个）
 	g.Get("c")
 
-	s := globalMetrics.Snapshot()
-	hits := s.Hits - snapBefore.Hits
-	misses := s.Misses - snapBefore.Misses
-	localLoads := s.LocalLoads - snapBefore.LocalLoads
-	evictions := s.Evictions - snapBefore.Evictions
-
-	if hits < 1 {
-		t.Fatalf("expected at least 1 hit, got %d", hits)
+	s := g.Metrics()
+	if s.Hits != 1 {
+		t.Fatalf("hits=%d, want 1", s.Hits)
 	}
-	if misses < 3 {
-		t.Fatalf("expected at least 3 misses, got %d", misses)
+	if s.Misses != 3 {
+		t.Fatalf("misses=%d, want 3", s.Misses)
 	}
-	if localLoads < 3 {
-		t.Fatalf("expected at least 3 local loads, got %d", localLoads)
+	if s.LocalLoads != 3 {
+		t.Fatalf("local loads=%d, want 3", s.LocalLoads)
 	}
-	if evictions < 1 {
-		t.Fatalf("expected at least 1 eviction, got %d", evictions)
+	if s.Evictions != 2 {
+		t.Fatalf("evictions=%d, want 2", s.Evictions)
 	}
-	rate := s.HitRate()
-	if rate < 0 || rate > 1 {
-		t.Fatalf("hit rate out of range: %.4f", rate)
+	rate := g.metrics.HitRate()
+	if rate != 0.25 {
+		t.Fatalf("lifetime hit rate=%.4f, want 0.25", rate)
 	}
 	t.Logf("hits=%d misses=%d loads=%d evictions=%d hit_rate=%.2f",
-		hits, misses, localLoads, evictions, rate)
+		s.Hits, s.Misses, s.LocalLoads, s.Evictions, rate)
+}
+
+func TestMetricsPerGroup(t *testing.T) {
+	getter := GetterFunc(func(key string) ([]byte, error) {
+		return []byte("v-" + key), nil
+	})
+	a := NewGroup("metrics-group-a", 1<<20, getter)
+	b := NewGroup("metrics-group-b", 1<<20, getter)
+
+	a.Get("k") // miss + local load
+	a.Get("k") // hit
+
+	as, bs := a.Metrics(), b.Metrics()
+	if as.Hits != 1 || as.Misses != 1 || as.LocalLoads != 1 {
+		t.Fatalf("group a metrics changed: %+v", as)
+	}
+	if bs != (MetricsSnapshot{}) {
+		t.Fatalf("group b must stay isolated, got %+v", bs)
+	}
+	if a.metrics == b.metrics {
+		t.Fatal("groups must not share a Metrics instance")
+	}
+}
+
+func TestMetricsHandlerPerGroupLabels(t *testing.T) {
+	getter := GetterFunc(func(key string) ([]byte, error) {
+		return []byte("v-" + key), nil
+	})
+	a := NewGroup("metrics-handler-a", 1<<20, getter)
+	b := NewGroup("metrics-handler-b", 1<<20, getter)
+
+	a.Get("x") // miss
+	a.Get("x") // hit
+	b.Get("y") // miss
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	MetricsHandler().ServeHTTP(rec, req)
+
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/plain") {
+		t.Fatalf("Content-Type=%q, want text/plain", ct)
+	}
+
+	body := rec.Body.String()
+	for _, want := range []string{
+		`geecache_hits_total{group="metrics-handler-a"} 1`,
+		`geecache_misses_total{group="metrics-handler-a"} 1`,
+		`geecache_local_loads_total{group="metrics-handler-a"} 1`,
+		`geecache_hits_total{group="metrics-handler-b"} 0`,
+		`geecache_misses_total{group="metrics-handler-b"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+
+	if strings.Contains(body, "geecache_hit_rate") {
+		t.Fatal("lifetime hit-rate gauge must not be exported")
+	}
+	if n := strings.Count(body, "# TYPE geecache_hits_total counter"); n != 1 {
+		t.Fatalf("HELP/TYPE for hits emitted %d times, want 1", n)
+	}
+}
+
+func TestMetricsConcurrentRecording(t *testing.T) {
+	const (
+		workers   = 8
+		perWorker = 1000
+	)
+	m := NewMetrics()
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				m.RecordHit()
+				m.RecordMiss()
+				_ = m.Snapshot()
+			}
+		}()
+	}
+	wg.Wait()
+
+	s := m.Snapshot()
+	if s.Hits != workers*perWorker || s.Misses != workers*perWorker {
+		t.Fatalf("snapshot=%+v, want hits=misses=%d", s, workers*perWorker)
+	}
 }
 
 var db = map[string]string{

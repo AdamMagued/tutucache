@@ -15,7 +15,7 @@ tutucache 是一个分布式内存缓存库，适用于需要**高并发读取**
 - **服务发现**：`ServiceDiscovery` 接口 + 文件发现实现，动态更新节点列表、重建哈希环
 - **双传输 + Protobuf**：HTTP 与 gRPC 两种通道共用 `PeerPicker`/`PeerGetter` 接口，序列化统一 protobuf
 - **只读字节视图**：`ByteView` 确保缓存值不会被外部意外修改
-- **指标埋点**：命中率、本地/远程加载次数等（Prometheus 格式 `/metrics`）
+- **指标埋点**：按 Group 隔离的命中/未命中、本地/远程加载、淘汰计数（Prometheus 格式 `/metrics`，带 `group` 标签）
 - **健康检查**：`/health` 存活探针
 - **优雅关闭**：监听退出信号，`http.Server.Shutdown` 等待请求处理完成
 - **接口解耦**：通过 `PeerPicker` / `PeerGetter` / `ServiceDiscovery` 接口隔离节点发现、网络通信与拓扑来源

@@ -66,7 +66,7 @@ Group.Get(key)
 - `FileDiscovery` 基于共享 `peers.json`，后台每 3 秒读一次，节点列表变化时回调 → `Pool.Set(peers...)` 重建哈希环，**动态更新 peer 列表**。
 
 ### 第 9 层：指标埋点 + 健康检查 + 优雅关闭
-- **指标**（`metrics.go`）：`sync/atomic` 计数命中/未命中/本地加载/远程加载/淘汰，`/metrics` 暴露命中率等。
+- **指标**（`metrics.go`）：每个 Group 独立计数命中/未命中/本地加载/远程加载/淘汰，锁保护的一致快照；`/metrics` 按 `group` 标签暴露原始计数器，命中率交给 Prometheus `rate()`。
 - **健康检查**：`/health` 返回 200 "OK"。
 - **优雅关闭**（`cmd/main.go`）：监听 SIGINT/SIGTERM → `http.Server.Shutdown` 等请求处理完再退（10s 超时）。
 
