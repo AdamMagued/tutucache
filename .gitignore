@@ -3,6 +3,7 @@ server
 server.exe
 # 服务发现运行时文件
 peers.json
+peers.json.lock
 
 # 本地问题清单（docs/issues 不入库）
 /docs/issues/

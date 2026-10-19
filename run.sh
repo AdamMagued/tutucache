@@ -20,16 +20,8 @@ set -e
 echo "[build] compiling..."
 go build -o server ./cmd
 
-# 预创建 peers.json，避免 3 个节点并发写文件导致覆盖
-echo '[build] creating peers.json...'
-cat > peers.json <<'EOF'
-[
-  "http://localhost:8001",
-  "http://localhost:8002",
-  "http://localhost:8003"
-]
-EOF
-
+# peers.json 由各节点启动时自行并发注册，Register 内部有跨进程文件锁，
+# 不需要预创建（保留 peers.json.lock 是正常的，锁文件不删除以避免竞争）。
 echo "[start] launching 3 nodes..."
 ./server -port=8001 &
 ./server -port=8002 &

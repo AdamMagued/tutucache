@@ -1,7 +1,6 @@
 import subprocess
 import time
 import os
-import json
 import signal
 import sys
 
@@ -47,14 +46,8 @@ def main():
         print("[Error] Go 编译失败，请检查 main.go 入口文件")
         return
 
-    # 2.5 预创建 peers.json：3 个节点并发 Register 会互相覆盖，
-    # 先写入完整节点列表，让各节点读到同一份内容（与 run.sh 一致）
-    with open("peers.json", "w") as f:
-        json.dump([
-            "http://localhost:8001",
-            "http://localhost:8002",
-            "http://localhost:8003",
-        ], f, indent=2)
+    # 2.5 不需要预创建 peers.json：Register 内部使用跨进程文件锁 + 原子替换，
+    # 3 个节点并发注册不会互相覆盖。
 
     # 3. 启动3个后台服务
     if sys.platform == "win32":
