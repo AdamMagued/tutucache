@@ -171,35 +171,32 @@ func (c *Cache) startCleanup(interval time.Duration) {
 **实现方案：**
 
 ```go
-// metrics.go — 新建文件
+// metrics.go — 每个 Group 持有独立的 Metrics 实例
 type Metrics struct {
-    mu        sync.RWMutex
-    Hits      int64  // 命中次数
-    Misses    int64  // 未命中次数
-    LocalLoads int64 // 从本地数据源加载次数
-    PeerLoads  int64 // 从远程节点加载次数
-    Evictions  int64 // 淘汰条目数
-    TotalBytes int64 // 当前占用内存
+    mu         sync.RWMutex
+    hits       int64 // 命中次数
+    misses     int64 // 未命中次数
+    localLoads int64 // 从本地数据源加载次数
+    peerLoads  int64 // 从远程节点加载次数
+    evictions  int64 // 淘汰条目数
 }
 
-var globalMetrics = &Metrics{}
-
-// 在 Group.Get、load、populateCache 等关键路径埋点
-func (m *Metrics) RecordHit()    { atomic.AddInt64(&m.Hits, 1) }
-func (m *Metrics) RecordMiss()   { atomic.AddInt64(&m.Misses, 1) }
-func (m *Metrics) HitRate() float64 {
-    total := atomic.LoadInt64(&m.Hits) + atomic.LoadInt64(&m.Misses)
-    if total == 0 { return 0 }
-    return float64(atomic.LoadInt64(&m.Hits)) / float64(total)
+// Snapshot 在锁内一次性拷贝所有字段，保证是同一时刻的一致视图
+func (m *Metrics) Snapshot() MetricsSnapshot {
+    m.mu.RLock()
+    defer m.mu.RUnlock()
+    return MetricsSnapshot{Hits: m.hits, Misses: m.misses, ...}
 }
 
-// 通过 HTTP 端点暴露 Prometheus 风格的指标
-func (p *HTTPPool) metricsHandler(w http.ResponseWriter, r *http.Request) {
-    fmt.Fprintf(w, "geecache_hits_total %d\n", atomic.LoadInt64(&globalMetrics.Hits))
-    fmt.Fprintf(w, "geecache_misses_total %d\n", atomic.LoadInt64(&globalMetrics.Misses))
-    fmt.Fprintf(w, "geecache_hit_rate %.4f\n", globalMetrics.HitRate())
-    // ...
-}
+// 在 Group.Get、getLocal、getFromPeer、OnEvicted 等路径埋点
+g.metrics.RecordHit()
+g.metrics.RecordMiss()
+
+// /metrics 按 group 标签输出原始计数器
+fmt.Fprintf(w, "geecache_hits_total{group=%q} %d\n", g.name, snap.Hits)
+fmt.Fprintf(w, "geecache_misses_total{group=%q} %d\n", g.name, snap.Misses)
+// 不导出 lifetime 命中率 gauge，由 Prometheus 端计算：
+// rate(geecache_hits_total[5m]) / (rate(hits[5m]) + rate(misses[5m]))
 ```
 
 **更完整的方案：** 集成 [prometheus/client_golang](https://github.com/prometheus/client_golang)，自动获得 Grafana 面板和告警能力。

@@ -12,6 +12,7 @@ type cache struct {
 	mu         sync.Mutex
 	lru        *lru.Cache
 	cacheBytes int64
+	metrics    *Metrics
 }
 
 func (c *cache) add(key string, value ByteView, ttl time.Duration) {
@@ -21,7 +22,9 @@ func (c *cache) add(key string, value ByteView, ttl time.Duration) {
 	if c.lru == nil {
 		// 懒初始化，第一次add才创建lru
 		c.lru = lru.New(c.cacheBytes, func(key string, v lru.Value) {
-			globalMetrics.RecordEviction()
+			if c.metrics != nil {
+				c.metrics.RecordEviction()
+			}
 		})
 	}
 	c.lru.Add(key, value, ttl)
