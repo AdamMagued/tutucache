@@ -134,7 +134,9 @@ func (g *Group) load(key string) (value ByteView, err error) {
 // 向远程GeeCache节点发起网络请求，获取缓存
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 	// 熔断器打开 → 快速失败，上层 load() 自动降级到 getLocal()
-	if g.breaker.IsOpen() {
+	// ticket 记录获准时的状态代数，迟到/失效的结果不会污染新状态
+	ticket, ok := g.breaker.Allow()
+	if !ok {
 		return ByteView{}, ErrCircuitOpen
 	}
 	//rpc 请求参数， response参数
@@ -146,11 +148,11 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 	//rpc调用
 	err := peer.Get(req, res)
 	if err != nil {
-		g.breaker.RecordFailure() // 失败计数+1
+		g.breaker.RecordFailure(ticket) // 失败计数+1
 		return ByteView{}, err
 	}
 
-	g.breaker.RecordSuccess() // 成功 → 重置熔断器
+	g.breaker.RecordSuccess(ticket) // 成功 → 重置熔断器
 	globalMetrics.RecordPeerLoad()
 	//包装成ByteView
 	return ByteView{b: res.Value}, nil

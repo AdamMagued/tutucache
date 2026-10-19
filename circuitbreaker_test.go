@@ -1,91 +1,302 @@
 package geecache
 
 import (
+	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	pb "geecache/geecachepb"
 )
 
+// breakerSnapshot 在锁内读取熔断器状态，避免测试本身引入数据竞争。
+func breakerSnapshot(cb *CircuitBreaker) (state State, failures int, probe bool, generation uint64) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return cb.state, cb.failureCount, cb.probeInFlight, cb.generation
+}
+
+func mustAllow(t *testing.T, cb *CircuitBreaker) Ticket {
+	t.Helper()
+	ticket, ok := cb.Allow()
+	if !ok {
+		t.Fatal("expected request to be admitted")
+	}
+	return ticket
+}
+
 func TestCircuitBreaker_ClosedToOpen(t *testing.T) {
-	// 阈值 2：连续失败 2 次就熔断
 	cb := NewCircuitBreaker(2, 5*time.Second)
 
-	// 初始 Closed，不应该阻断
-	if cb.IsOpen() {
-		t.Fatal("expected closed initially")
+	// 第 1 次失败：仍在 Closed，计数为 1
+	cb.RecordFailure(mustAllow(t, cb))
+	if state, failures, _, _ := breakerSnapshot(cb); state != StateClosed || failures != 1 {
+		t.Fatalf("after 1 failure: state=%v failures=%d, want closed/1", state, failures)
 	}
 
-	// 第 1 次失败
-	cb.RecordFailure()
-	if cb.IsOpen() {
-		t.Fatal("expected still closed after 1 failure")
+	// 第 2 次失败：达到阈值，进入 Open
+	cb.RecordFailure(mustAllow(t, cb))
+	if state, _, _, _ := breakerSnapshot(cb); state != StateOpen {
+		t.Fatalf("after 2 failures: state=%v, want open", state)
 	}
 
-	// 第 2 次失败 → 达到阈值，进入 Open
-	cb.RecordFailure()
-	if !cb.IsOpen() {
-		t.Fatal("expected open after 2 failures")
+	// Open 且冷却未到 → 拒绝准入
+	if _, ok := cb.Allow(); ok {
+		t.Fatal("open breaker should reject requests")
 	}
 }
 
-func TestCircuitBreaker_OpenToHalfOpen(t *testing.T) {
-	// 阈值 1 + 超时 50ms
-	cb := NewCircuitBreaker(1, 50*time.Millisecond)
+func TestCircuitBreaker_ClosedSuccessResetsFailureCount(t *testing.T) {
+	cb := NewCircuitBreaker(2, time.Hour)
 
-	// 触发熔断
-	cb.RecordFailure()
-	if !cb.IsOpen() {
-		t.Fatal("expected open after failure")
+	cb.RecordFailure(mustAllow(t, cb))
+	cb.RecordSuccess(mustAllow(t, cb)) // 重置连续失败计数
+	cb.RecordFailure(mustAllow(t, cb))
+
+	if state, failures, _, _ := breakerSnapshot(cb); state != StateClosed || failures != 1 {
+		t.Fatalf("after fail/success/fail: state=%v failures=%d, want closed/1", state, failures)
 	}
 
-	// 立即查 → 仍然 Open
-	if !cb.IsOpen() {
-		t.Fatal("expected still open immediately")
+	// 再来一次失败才达到阈值
+	cb.RecordFailure(mustAllow(t, cb))
+	if state, _, _, _ := breakerSnapshot(cb); state != StateOpen {
+		t.Fatalf("state=%v, want open after 2 consecutive failures", state)
+	}
+}
+
+func TestCircuitBreaker_OpenToHalfOpenReservesOneProbe(t *testing.T) {
+	cb := NewCircuitBreaker(1, 30*time.Millisecond)
+
+	cb.RecordFailure(mustAllow(t, cb))
+	_, _, _, genBefore := breakerSnapshot(cb)
+
+	if _, ok := cb.Allow(); ok {
+		t.Fatal("open breaker should reject during cooldown")
 	}
 
-	// 等超时 → 进入 HalfOpen
-	time.Sleep(60 * time.Millisecond)
-	if cb.IsOpen() {
-		t.Fatal("expected half-open after timeout, got still open")
+	time.Sleep(50 * time.Millisecond)
+
+	// 冷却到期：第一个请求成为探测，占住唯一名额
+	probe := mustAllow(t, cb)
+	state, _, inFlight, genAfter := breakerSnapshot(cb)
+	if state != StateHalfOpen || !inFlight || genAfter != genBefore+1 {
+		t.Fatalf("after cooldown: state=%v probeInFlight=%v gen=%d, want half-open/true/%d",
+			state, inFlight, genAfter, genBefore+1)
+	}
+
+	// 半开期间的其他请求必须被拒绝
+	if _, ok := cb.Allow(); ok {
+		t.Fatal("half-open must admit only one probe")
+	}
+
+	// 探测成功 → Closed，名额释放，计数清零
+	cb.RecordSuccess(probe)
+	if state, failures, inFlight, _ := breakerSnapshot(cb); state != StateClosed || failures != 0 || inFlight {
+		t.Fatalf("after probe success: state=%v failures=%d probeInFlight=%v, want closed/0/false",
+			state, failures, inFlight)
 	}
 }
 
 func TestCircuitBreaker_HalfOpenSuccess(t *testing.T) {
-	// 阈值 2：半开成功后计数器重置，再来一次失败不会熔断
-	cb := NewCircuitBreaker(2, 50*time.Millisecond)
+	cb := NewCircuitBreaker(2, 30*time.Millisecond)
 
-	// 连败两次 → 触发熔断
-	cb.RecordFailure()
-	cb.RecordFailure()
-	if !cb.IsOpen() {
-		t.Fatal("expected open after 2 failures")
+	cb.RecordFailure(mustAllow(t, cb))
+	cb.RecordFailure(mustAllow(t, cb))
+	if state, _, _, _ := breakerSnapshot(cb); state != StateOpen {
+		t.Fatalf("state=%v, want open", state)
 	}
 
-	time.Sleep(60 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	probe := mustAllow(t, cb)
+	cb.RecordSuccess(probe)
 
-	// HalfOpen 状态下来一个成功 → 回到 Closed
-	cb.RecordSuccess()
-	if cb.IsOpen() {
-		t.Fatal("expected closed after success in half-open")
-	}
-
-	// 再失败一次不应该立即熔断（计数器从 0 开始，需要 2 次才熔断）
-	cb.RecordFailure()
-	if cb.IsOpen() {
-		t.Fatal("expected still closed, counter should be reset to 0 then 1 < thresh 2")
+	// 计数已清零：一次失败不会立即熔断
+	cb.RecordFailure(mustAllow(t, cb))
+	if state, failures, _, _ := breakerSnapshot(cb); state != StateClosed || failures != 1 {
+		t.Fatalf("after recovery: state=%v failures=%d, want closed/1", state, failures)
 	}
 }
 
 func TestCircuitBreaker_HalfOpenFailure(t *testing.T) {
-	cb := NewCircuitBreaker(1, 50*time.Millisecond)
+	cb := NewCircuitBreaker(1, 30*time.Millisecond)
 
-	// Closed → 失败 → Open
-	cb.RecordFailure()
-	time.Sleep(60 * time.Millisecond)
+	cb.RecordFailure(mustAllow(t, cb))
+	time.Sleep(50 * time.Millisecond)
 
-	// HalfOpen → 失败 → 回到 Open
-	cb.RecordFailure()
-	if !cb.IsOpen() {
-		t.Fatal("expected back to open after half-open failure")
+	probe := mustAllow(t, cb)
+	cb.RecordFailure(probe)
+
+	// 探测失败 → 回到 Open，并释放名额
+	state, _, inFlight, _ := breakerSnapshot(cb)
+	if state != StateOpen || inFlight {
+		t.Fatalf("after probe failure: state=%v probeInFlight=%v, want open/false", state, inFlight)
+	}
+
+	// 冷却必须从探测失败时刻重新计算
+	if _, ok := cb.Allow(); ok {
+		t.Fatal("cooldown should restart after probe failure")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, ok := cb.Allow(); !ok {
+		t.Fatal("expected a new probe after the restarted cooldown")
+	}
+}
+
+func TestCircuitBreaker_StaleSuccessDoesNotCloseOpen(t *testing.T) {
+	cb := NewCircuitBreaker(3, time.Hour)
+
+	// stale 是 Closed 状态下获准的旧请求
+	stale := mustAllow(t, cb)
+
+	// 其他请求连续失败，达到阈值进入 Open
+	for i := 0; i < 3; i++ {
+		cb.RecordFailure(mustAllow(t, cb))
+	}
+	if state, _, _, _ := breakerSnapshot(cb); state != StateOpen {
+		t.Fatalf("state=%v, want open after threshold failures", state)
+	}
+	_, failuresBefore, _, genBefore := breakerSnapshot(cb)
+
+	// 旧请求此时才成功，必须整体作废
+	cb.RecordSuccess(stale)
+
+	state, failuresAfter, inFlight, genAfter := breakerSnapshot(cb)
+	if state != StateOpen || failuresAfter != failuresBefore || inFlight || genAfter != genBefore {
+		t.Fatalf("stale success changed state: state=%v failures=%d gen=%d, want open/%d/%d",
+			state, failuresAfter, genAfter, failuresBefore, genBefore)
+	}
+}
+
+func TestCircuitBreaker_StaleFailureDoesNotExtendCooldown(t *testing.T) {
+	cb := NewCircuitBreaker(1, 30*time.Millisecond)
+
+	stale := mustAllow(t, cb)
+	cb.RecordFailure(mustAllow(t, cb)) // 进入 Open
+	time.Sleep(50 * time.Millisecond)
+
+	// 若被接受，会刷新 lastFailure 并让下面的 Allow 继续拒绝
+	cb.RecordFailure(stale)
+
+	if _, ok := cb.Allow(); !ok {
+		t.Fatal("stale failure must not extend cooldown")
+	}
+}
+
+func TestCircuitBreaker_StaleFailureDoesNotCountAfterRecovery(t *testing.T) {
+	cb := NewCircuitBreaker(1, 30*time.Millisecond)
+
+	stale := mustAllow(t, cb)
+	cb.RecordFailure(mustAllow(t, cb))
+	time.Sleep(50 * time.Millisecond)
+
+	probe := mustAllow(t, cb)
+	cb.RecordSuccess(probe) // 恢复为 Closed，代数再次 +1
+
+	cb.RecordFailure(stale) // 旧代数结果，不能把 Closed 再次打回 Open
+
+	if state, failures, _, _ := breakerSnapshot(cb); state != StateClosed || failures != 0 {
+		t.Fatalf("stale failure changed recovered breaker: state=%v failures=%d, want closed/0",
+			state, failures)
+	}
+}
+
+func TestCircuitBreaker_DuplicateProbeCallbackIgnored(t *testing.T) {
+	cb := NewCircuitBreaker(1, 30*time.Millisecond)
+
+	cb.RecordFailure(mustAllow(t, cb))
+	time.Sleep(50 * time.Millisecond)
+	probe := mustAllow(t, cb)
+	cb.RecordSuccess(probe)
+
+	_, _, _, genBefore := breakerSnapshot(cb)
+
+	// 同一个探测票重复回填：第一次结果已迁移状态，后续必须作废
+	cb.RecordFailure(probe)
+	cb.RecordSuccess(probe)
+
+	if state, failures, inFlight, genAfter := breakerSnapshot(cb); state != StateClosed || failures != 0 || inFlight || genAfter != genBefore {
+		t.Fatalf("duplicate probe callback changed state: state=%v failures=%d gen=%d, want closed/0/%d",
+			state, failures, genAfter, genBefore)
+	}
+}
+
+func TestCircuitBreaker_ZeroTicketIgnored(t *testing.T) {
+	cb := NewCircuitBreaker(1, time.Hour)
+
+	cb.RecordSuccess(Ticket{})
+	cb.RecordFailure(Ticket{})
+
+	if state, failures, inFlight, generation := breakerSnapshot(cb); state != StateClosed || failures != 0 || inFlight || generation != 1 {
+		t.Fatalf("zero ticket changed state: state=%v failures=%d gen=%d, want closed/0/1",
+			state, failures, generation)
+	}
+}
+
+func TestCircuitBreaker_ConcurrentFailuresTripOnce(t *testing.T) {
+	const (
+		thresh  = 5
+		workers = 100
+	)
+	cb := NewCircuitBreaker(thresh, time.Hour)
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			if ticket, ok := cb.Allow(); ok {
+				cb.RecordFailure(ticket)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// 只有触发熔断的那一代失败被计数；其余在途结果全部失效
+	state, failures, _, generation := breakerSnapshot(cb)
+	if state != StateOpen {
+		t.Fatalf("state=%v, want open", state)
+	}
+	if failures != thresh {
+		t.Fatalf("failures=%d, want exactly %d", failures, thresh)
+	}
+	if generation != 2 {
+		t.Fatalf("generation=%d, want 2 (one closed->open transition)", generation)
+	}
+}
+
+func TestCircuitBreaker_ConcurrentHalfOpenAdmitsOneProbe(t *testing.T) {
+	cb := NewCircuitBreaker(1, 20*time.Millisecond)
+	cb.RecordFailure(mustAllow(t, cb))
+	time.Sleep(50 * time.Millisecond)
+
+	const workers = 50
+	admitted := make(chan Ticket, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			if ticket, ok := cb.Allow(); ok {
+				admitted <- ticket
+			}
+		}()
+	}
+	wg.Wait()
+	close(admitted)
+
+	if got := len(admitted); got != 1 {
+		t.Fatalf("half-open admitted %d probes, want exactly 1", got)
+	}
+
+	probe := <-admitted
+	if state, _, inFlight, _ := breakerSnapshot(cb); state != StateHalfOpen || !inFlight {
+		t.Fatalf("state=%v probeInFlight=%v, want half-open/true", state, inFlight)
+	}
+
+	cb.RecordSuccess(probe)
+	if state, _, inFlight, _ := breakerSnapshot(cb); state != StateClosed || inFlight {
+		t.Fatalf("state=%v probeInFlight=%v, want closed/false", state, inFlight)
 	}
 }
 
@@ -113,7 +324,38 @@ func TestCircuitBreaker_WithGroup(t *testing.T) {
 	}
 
 	// breaker 应该还是 Closed（从来没被调用过）
-	if g.breaker.IsOpen() {
-		t.Fatal("breaker should be closed, getFromPeer was never called")
+	if state, _, _, _ := breakerSnapshot(g.breaker); state != StateClosed {
+		t.Fatalf("breaker state=%v, want closed; getFromPeer was never called", state)
+	}
+}
+
+type failingPeer struct {
+	calls atomic.Int32
+}
+
+func (p *failingPeer) Get(*pb.Request, *pb.Response) error {
+	p.calls.Add(1)
+	return errors.New("peer down")
+}
+
+func TestCircuitBreaker_GetFromPeerFastFails(t *testing.T) {
+	g := NewGroup("cb-peer-test", 1<<20, GetterFunc(
+		func(key string) ([]byte, error) { return []byte("local-" + key), nil },
+	))
+	peer := &failingPeer{}
+
+	// NewGroup 的阈值为 3：前三次真实请求失败并计数
+	for i := 0; i < 3; i++ {
+		if _, err := g.getFromPeer(peer, "foo"); err == nil {
+			t.Fatalf("call %d: expected peer error", i+1)
+		}
+	}
+
+	// 第四次被熔断器快速拒绝，不再触达 peer
+	if _, err := g.getFromPeer(peer, "foo"); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("expected ErrCircuitOpen, got %v", err)
+	}
+	if got := peer.calls.Load(); got != 3 {
+		t.Fatalf("peer called %d times, want 3 (fourth rejected by breaker)", got)
 	}
 }

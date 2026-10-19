@@ -607,34 +607,41 @@ HalfOpen（半开，只放行探测请求）
 ### 11.3 实现要点
 
 ```go
+type Ticket struct {
+    generation uint64 // 准入时的状态代数，零值无效
+}
+
 type CircuitBreaker struct {
     mu            sync.Mutex
     state         State  // Closed / Open / HalfOpen
+    generation    uint64 // 每次状态迁移 +1
     failureCount  int
     failureThresh int           // 连续失败多少次 → 熔断
     timeout       time.Duration // 熔断多久后尝试恢复
     lastFailure   time.Time
+    probeInFlight bool          // HalfOpen 探测名额是否已被占用
 }
 ```
 
-- **`IsOpen()`**：Closed→false；Open→若已过冷却期则切到 HalfOpen 并放行一个探测，否则拒绝；HalfOpen→放行探测。**半开是惰性触发的**——有请求来且已过冷却期才切。
-- **`RecordSuccess()`**：直接复位 Closed + 清零计数。
-- **`RecordFailure()`**：计数 +1；当 `failureCount >= threshold` 或当前是 HalfOpen 时切 Open。
+- **`Allow() (Ticket, bool)`**：Closed→放行并返回当前代 ticket；Open→若已过冷却期则原子地切到 HalfOpen、`generation++`、预约探测名额并放行当前请求，否则拒绝；HalfOpen→名额已占用，拒绝其他请求。**半开是惰性触发的**——有请求来且已过冷却期才切。
+- **`RecordSuccess(ticket)`**：先校验代数；Closed 下清零计数，HalfOpen 探测成功则切回 Closed 并释放名额。
+- **`RecordFailure(ticket)`**：先校验代数；Closed 下计数 +1，达到阈值切 Open；HalfOpen 探测失败则切回 Open 并重新计算冷却起点。失效 ticket 不计数、不修改 `lastFailure`。
 
 ### 11.4 接入点：getFromPeer
 
 ```go
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
-    if g.breaker.IsOpen() {               // 熔断打开 → 快速失败
+    ticket, ok := g.breaker.Allow()       // 熔断打开 → 拒绝
+    if !ok {
         return ByteView{}, ErrCircuitOpen
     }
     req := &pb.Request{Group: g.name, Key: key}
     res := &pb.Response{}
     if err := peer.Get(req, res); err != nil {
-        g.breaker.RecordFailure()         // 远程失败 → 计数
+        g.breaker.RecordFailure(ticket)   // 远程失败 → 计数（携带准入代数）
         return ByteView{}, err
     }
-    g.breaker.RecordSuccess()             // 成功 → 复位
+    g.breaker.RecordSuccess(ticket)       // 成功 → 复位（携带准入代数）
     return ByteView{b: res.Value}, nil
 }
 ```
@@ -709,7 +716,7 @@ server.Shutdown(ctx)                     // 停收新连接，等现有请求完
               │  一致性哈希: hash("Tom") → 在环上查 → 节点 :8002
               ▼
            getFromPeer(:8002, "Tom")
-              │  ① breaker.IsOpen()? 熔断则降级
+              │  ① breaker.Allow() 拒绝？熔断则降级
               │  ② HTTP GET http://localhost:8002/_geecache/scores/Tom
               │     （或 gRPC GroupCache.Get）
               ▼
