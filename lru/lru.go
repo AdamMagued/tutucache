@@ -107,6 +107,12 @@ func (c *Cache) Len() int {
 	return c.ll.Len()
 }
 
+// Bytes 返回当前缓存占用的字节数（所有条目的 key + value 之和）。
+// 与 Len / CleanupExpired 一样，调用方必须自行同步对 Cache 的并发访问。
+func (c *Cache) Bytes() int64 {
+	return c.nbytes
+}
+
 // CleanupExpired 主动扫描，删除全部已过期条目
 // 注意：调用这个方法前，外部必须自行加锁！
 // 返回本次清理删除的条目数量

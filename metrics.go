@@ -86,8 +86,9 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 // =============================================================================
 
 type groupMetrics struct {
-	name string
-	snap MetricsSnapshot
+	name       string
+	snap       MetricsSnapshot
+	cacheBytes int64 // 抓取时从 LRU 实时读取，不是 Metrics 里的计数器
 }
 
 // MetricsHandler 返回一个 http.Handler，按 group 标签暴露 Prometheus 风格指标。
@@ -106,25 +107,31 @@ func MetricsHandler() http.Handler {
 
 		rows := make([]groupMetrics, 0, len(gs))
 		for _, g := range gs {
-			rows = append(rows, groupMetrics{name: g.name, snap: g.metrics.Snapshot()})
+			rows = append(rows, groupMetrics{
+				name:       g.name,
+				snap:       g.metrics.Snapshot(),
+				cacheBytes: g.mainCache.Bytes(),
+			})
 		}
 
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 
-		writeCounter(w, "geecache_hits_total", "Total number of cache hits", rows, func(s MetricsSnapshot) int64 { return s.Hits })
-		writeCounter(w, "geecache_misses_total", "Total number of cache misses", rows, func(s MetricsSnapshot) int64 { return s.Misses })
-		writeCounter(w, "geecache_local_loads_total", "Total number of local loads", rows, func(s MetricsSnapshot) int64 { return s.LocalLoads })
-		writeCounter(w, "geecache_peer_loads_total", "Total number of peer loads", rows, func(s MetricsSnapshot) int64 { return s.PeerLoads })
-		writeCounter(w, "geecache_evictions_total", "Total number of evictions", rows, func(s MetricsSnapshot) int64 { return s.Evictions })
+		// 内存占用是 gauge：每次抓取都从 LRU 的实时状态派生。
+		writeMetric(w, "geecache_cache_bytes", "Current number of bytes used by cached keys and values", "gauge", rows, func(r groupMetrics) int64 { return r.cacheBytes })
+		writeMetric(w, "geecache_hits_total", "Total number of cache hits", "counter", rows, func(r groupMetrics) int64 { return r.snap.Hits })
+		writeMetric(w, "geecache_misses_total", "Total number of cache misses", "counter", rows, func(r groupMetrics) int64 { return r.snap.Misses })
+		writeMetric(w, "geecache_local_loads_total", "Total number of local loads", "counter", rows, func(r groupMetrics) int64 { return r.snap.LocalLoads })
+		writeMetric(w, "geecache_peer_loads_total", "Total number of peer loads", "counter", rows, func(r groupMetrics) int64 { return r.snap.PeerLoads })
+		writeMetric(w, "geecache_evictions_total", "Total number of evictions", "counter", rows, func(r groupMetrics) int64 { return r.snap.Evictions })
 	})
 }
 
-// writeCounter 输出一个指标族：HELP/TYPE 各一次，然后每个 group 一条序列。
-func writeCounter(w http.ResponseWriter, name, help string, rows []groupMetrics, value func(MetricsSnapshot) int64) {
+// writeMetric 输出一个指标族：HELP/TYPE 各一次，然后每个 group 一条序列。
+func writeMetric(w http.ResponseWriter, name, help, typ string, rows []groupMetrics, value func(groupMetrics) int64) {
 	fmt.Fprintf(w, "# HELP %s %s\n", name, help)
-	fmt.Fprintf(w, "# TYPE %s counter\n", name)
+	fmt.Fprintf(w, "# TYPE %s %s\n", name, typ)
 	for _, r := range rows {
-		fmt.Fprintf(w, "%s{group=%q} %d\n", name, r.name, value(r.snap))
+		fmt.Fprintf(w, "%s{group=%q} %d\n", name, r.name, value(r))
 	}
 }
 

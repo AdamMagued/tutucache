@@ -671,6 +671,7 @@ type Metrics struct {
 - `HitRate()` 仍存在，但语义是 lifetime ratio；`/metrics` 不导出它，近期命中率由 Prometheus 对 `_total` 计数器求 `rate()`。
 - 埋点位置：命中/未命中在 `Get`；本地加载在 `getLocal`；远程加载在 `getFromPeer` 成功时；淘汰在 LRU 的 `OnEvicted` 回调。
 - `/metrics` 输出带 `group="..."` 标签的原始计数器。
+- `geecache_cache_bytes` 是按 group 导出的 gauge：抓取时读取 LRU 的实时占用（`lru.Bytes()` → `cache.Bytes()` → `Group.CacheBytes()`），不维护可能漂移的独立计数器。
 
 ### 12.2 健康检查
 

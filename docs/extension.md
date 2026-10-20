@@ -195,6 +195,8 @@ g.metrics.RecordMiss()
 // /metrics 按 group 标签输出原始计数器
 fmt.Fprintf(w, "geecache_hits_total{group=%q} %d\n", g.name, snap.Hits)
 fmt.Fprintf(w, "geecache_misses_total{group=%q} %d\n", g.name, snap.Misses)
+// 内存占用是 gauge：抓取时从 LRU 的实时状态派生，不维护独立计数器
+fmt.Fprintf(w, "geecache_cache_bytes{group=%q} %d\n", g.name, g.CacheBytes())
 // 不导出 lifetime 命中率 gauge，由 Prometheus 端计算：
 // rate(geecache_hits_total[5m]) / (rate(hits[5m]) + rate(misses[5m]))
 ```

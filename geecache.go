@@ -52,6 +52,12 @@ func (g *Group) Metrics() MetricsSnapshot {
 	return g.metrics.Snapshot()
 }
 
+// CacheBytes 返回当前 Group 本地缓存的实时字节占用。
+// 该值在调用时从 LRU 读取，而不是单独维护的计数器，因此不会与真实内存用量漂移。
+func (g *Group) CacheBytes() int64 {
+	return g.mainCache.Bytes()
+}
+
 func (g *Group) RegisterPeers(peers PeerPicker) {
 	if g.peers != nil {
 		panic("RegisterPeerPicker called more than once")
