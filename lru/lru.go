@@ -2,13 +2,19 @@ package lru
 
 import (
 	"container/list"
+	"fmt"
 	"time"
 )
+
+// Unlimited 表示不限制缓存内存占用，用于 New 的 maxBytes 参数。
+// 0 是唯一表示"不限制"的取值；负数是非法配置，New 会在构造时 panic，
+// 而不是静默地让每次 Add 都把刚写入的条目淘汰掉。
+const Unlimited int64 = 0
 
 // Cache 带TTL过期能力的LRU缓存
 // 内存上限maxBytes；同时支持惰性过期(Get时检查) + 主动全量扫描过期(CleanupExpired)
 type Cache struct {
-	maxBytes  int64                         // 最大允许占用字节数，0代表不限制内存
+	maxBytes  int64                         // 最大允许占用字节数，Unlimited(0)代表不限制内存
 	nbytes    int64                         // 当前已经占用总内存(key+value)
 	ll        *list.List                    // 双向链表：Front是最近访问，Back是最久未访问
 	cache     map[string]*list.Element      // 哈希表，key映射链表节点，O(1)查找
@@ -28,7 +34,12 @@ type Value interface {
 }
 
 // New 创建LRU缓存实例
+// maxBytes 必须 >= 0：Unlimited(0) 是显式的"不限制内存"哨兵值；
+// 负数属于非法配置，构造时直接 panic，避免静默变成"每次 Add 立即淘汰"。
 func New(maxBytes int64, onEvicted func(string, Value)) *Cache {
+	if maxBytes < 0 {
+		panic(fmt.Sprintf("lru: maxBytes must be >= 0 (0 means unlimited), got %d", maxBytes))
+	}
 	return &Cache{
 		maxBytes:  maxBytes,
 		ll:        list.New(),
@@ -97,7 +108,7 @@ func (c *Cache) Add(key string, value Value, ttl time.Duration) {
 		c.nbytes += int64(len(key)) + int64(value.Len())
 	}
 	// 内存超限，循环淘汰最久未访问
-	for c.maxBytes != 0 && c.maxBytes < c.nbytes {
+	for c.maxBytes != Unlimited && c.maxBytes < c.nbytes {
 		c.RemoveOldest()
 	}
 }

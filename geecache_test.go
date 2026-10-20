@@ -12,6 +12,33 @@ import (
 	"testing"
 )
 
+func TestNewGroupRejectsNegativeCacheBytes(t *testing.T) {
+	const name = "negative-cache-bytes"
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("NewGroup with negative cacheBytes should panic")
+		}
+		if GetGroup(name) != nil {
+			t.Fatal("group with invalid cacheBytes must not be registered")
+		}
+	}()
+	NewGroup(name, -1, GetterFunc(func(key string) ([]byte, error) {
+		return []byte(key), nil
+	}))
+}
+
+func TestNewGroupZeroCacheBytesIsUnlimited(t *testing.T) {
+	g := NewGroup("unlimited-cache-bytes", 0, GetterFunc(func(key string) ([]byte, error) {
+		return []byte(key), nil
+	}))
+	if _, err := g.Get("a"); err != nil {
+		t.Fatalf("Get on unlimited group failed: %v", err)
+	}
+	if got := g.mainCache.lru.Len(); got != 1 {
+		t.Fatalf("len=%d, want 1 (0 means unlimited)", got)
+	}
+}
+
 func TestGetter(t *testing.T) {
 	var f Getter = GetterFunc(func(key string) ([]byte, error) {
 		return []byte(key), nil
