@@ -2,6 +2,7 @@ package geecache
 
 import (
 	"fmt"
+	pb "geecache/geecachepb"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -201,6 +202,30 @@ var db = map[string]string{
 	"Tom":  "630",
 	"Jack": "589",
 	"Sam":  "567",
+}
+
+// TestHTTPProtoRoundTrip 走完整的 HTTP 传输路径（服务端 Marshal → 客户端 Unmarshal），
+// 确保 http.go 与 peers_grpc.go 使用同一个 protobuf runtime 后线格式仍然一致。
+func TestHTTPProtoRoundTrip(t *testing.T) {
+	const group = "http-proto-roundtrip"
+	NewGroup(group, 1<<20, GetterFunc(
+		func(key string) ([]byte, error) {
+			return []byte("v-" + key), nil
+		},
+	))
+
+	pool := NewHTTPPool("http://self")
+	srv := httptest.NewServer(pool)
+	defer srv.Close()
+
+	getter := newHTTPGetter(srv.URL+defaultBasePath, nil, "")
+	res := &pb.Response{}
+	if err := getter.Get(&pb.Request{Group: group, Key: "k"}, res); err != nil {
+		t.Fatalf("HTTP get failed: %v", err)
+	}
+	if got := string(res.Value); got != "v-k" {
+		t.Fatalf("value=%q, want %q", got, "v-k")
+	}
 }
 
 func TestGet(t *testing.T) {
