@@ -351,6 +351,7 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 - 写入和 `Snapshot` 共用一把 `sync.RWMutex`：`Snapshot` 一次拷完全部字段，得到某一时刻的一致视图。
 - 埋点位置：命中/未命中在 `Get`；本地加载在 `getLocal`；远程加载在 `getFromPeer` 成功时；淘汰在 `OnEvicted` 回调。
 - `/metrics` 输出带 `group="..."` 标签的原始 `_total` 计数器；不导出 lifetime 命中率 gauge，近期命中率由 Prometheus 对计数器求 `rate()`。
+- 内存占用 `geecache_cache_bytes` 是 gauge：每次抓取时在 `cache.mu` 保护下读取 `lru.nbytes`（`lru.Bytes()` → `cache.Bytes()` → `Group.CacheBytes()`），按 group 输出；不额外维护 atomic 镜像，避免与真实状态漂移。
 
 **健康检查**：`/health` 返回 200 + "OK"，最简存活探针（liveness），免鉴权。
 
@@ -505,12 +506,12 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 - **诚实且加分的说法**：> 「我实现了 HTTP 和 gRPC 两种传输，通过 PeerPicker/PeerGetter 接口解耦，序列化统一用 protobuf。demo 主入口当前走 HTTP，gRPC 通道我写了完整的单测和 bufconn 集成测试覆盖。之所以能这么做，正是接口解耦的好处——切通道不改核心逻辑。」
 - **要不要补**：如果想让简历 bullet 100% 硬，可以把 main 切到 gRPC（给 `GRPCPool` 补 `StartDiscovery`、`startCacheServer` 换成 `NewGRPCPool`+`Serve()`）。**属于可选的代码增强，我可以帮你做**。不改代码的话，上面这个说法也完全站得住，且显得你理解双通道设计。
 
-### 雷点 2：`cache_bytes` 指标已移除，真实内存占用尚未导出
+### 雷点 2（已修复）：`cache_bytes` 曾恒为 0
 
-- **事实**：原实现有 `TotalBytes` 字段和 `SetTotalBytes`，但全项目无人调用，`geecache_cache_bytes` 恒为 0。修复 #33 时已删除这个死指标及字段，避免继续输出误导性数据。
-- **面试官可能问**：「你的 /metrics 为什么没有内存占用？」
-- **诚实说法**：> 「之前有个恒为 0 的死 gauge，我把它删了。要恢复应该从 LRU 的实时状态派生：给 `lru.Cache` 加 `Bytes()`，exporter 在 `cache.mu` 保护下读取，按 group 输出，而不是单独维护一个会漂移的 atomic。」
-- **怎么补**：见 issue #11；核心是不要用独立计数器镜像 LRU 状态，而是在抓取时读 `lru.nbytes`。
+- **事实**：原实现有 `TotalBytes` 字段和 `SetTotalBytes`，但全项目无人调用，`geecache_cache_bytes` 恒为 0。修复 #33 时先删除了这个死指标；之后在 #11 中按「从实时状态派生」的方式恢复。
+- **修复方式**：`lru.Cache.Bytes()` 暴露 `nbytes`，`cache.Bytes()` 在 `cache.mu` 保护下读取（LRU 未初始化时返回 0），`Group.CacheBytes()` 对外暴露；`MetricsHandler` 在每次抓取时按 group 读取并输出 `geecache_cache_bytes{group="..."}`（TYPE 为 gauge）。
+- **面试官可能问**：「你的 /metrics 为什么没有内存占用？」「这个值会不会和真实用量对不上？」
+- **诚实说法**：> 「之前有个恒为 0 的死 gauge，我先把它删了，后来改成抓取时从 LRU 的实时状态派生：`lru.Bytes()` 返回 `nbytes`，在 `cache.mu` 保护下按 group 读取。没有单独维护 atomic 镜像，所以不会漂移；代价是它和计数器不是同一把锁下的严格快照，但两者本来就是独立的指标族。」
 
 ### 雷点 3：后台 goroutine 没纳入优雅关闭
 

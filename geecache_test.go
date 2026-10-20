@@ -83,6 +83,53 @@ func TestMetricsPerGroup(t *testing.T) {
 	}
 }
 
+func TestCacheBytes(t *testing.T) {
+	g := NewGroup("cache-bytes", 1<<20, GetterFunc(
+		func(key string) ([]byte, error) {
+			return []byte("v-" + key), nil
+		},
+	))
+
+	if got := g.CacheBytes(); got != 0 {
+		t.Fatalf("empty group bytes=%d, want 0", got)
+	}
+
+	g.Get("a") // key "a" (1B) + value "v-a" (3B) = 4B
+	if got := g.CacheBytes(); got != 4 {
+		t.Fatalf("bytes after populate=%d, want 4", got)
+	}
+
+	g.Get("a") // 命中不应改变占用
+	if got := g.CacheBytes(); got != 4 {
+		t.Fatalf("bytes after hit=%d, want 4", got)
+	}
+}
+
+func TestMetricsHandlerCacheBytes(t *testing.T) {
+	getter := GetterFunc(func(key string) ([]byte, error) {
+		return []byte("v-" + key), nil
+	})
+	a := NewGroup("metrics-bytes-a", 1<<20, getter)
+	NewGroup("metrics-bytes-b", 1<<20, getter) // 不写入，导出值应为 0
+
+	a.Get("x") // key "x" (1B) + value "v-x" (3B) = 4B
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	MetricsHandler().ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	for _, want := range []string{
+		"# TYPE geecache_cache_bytes gauge",
+		`geecache_cache_bytes{group="metrics-bytes-a"} 4`,
+		`geecache_cache_bytes{group="metrics-bytes-b"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}
+
 func TestMetricsHandlerPerGroupLabels(t *testing.T) {
 	getter := GetterFunc(func(key string) ([]byte, error) {
 		return []byte("v-" + key), nil

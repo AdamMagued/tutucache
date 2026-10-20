@@ -30,6 +30,17 @@ func (c *cache) add(key string, value ByteView, ttl time.Duration) {
 	c.lru.Add(key, value, ttl)
 }
 
+// Bytes 返回本地缓存当前的字节占用；LRU 尚未初始化时为 0。
+// 直接读取 LRU 的实时状态，不额外维护计数器，避免两者漂移。
+func (c *cache) Bytes() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lru == nil {
+		return 0
+	}
+	return c.lru.Bytes()
+}
+
 /*
 LRU的get会执行MoveTofront修改链表结构
 */
