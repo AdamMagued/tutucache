@@ -19,10 +19,18 @@ import (
 */
 // 提供被其他节点访问的能力
 
+// Getter 负责在缓存未命中时回源加载数据。
+// Getter 内可以调用 Get 加载其他 key，但不能在加载 key K 的过程中（同一
+// goroutine 内）再次调用 Get(K)：这会形成等待自身的循环，此时会立即返回
+// ErrReentrantLoad。跨 goroutine 的循环依赖无法自动识别，仍需调用方避免。
 type Getter interface {
 	// []byte 想一下byteview, 二进制
 	Get(key string) ([]byte, error)
 }
+
+// ErrReentrantLoad 表示 Getter 在加载某个 key 时，又通过 Get 加载同一个 key。
+// 这种循环等待无法解开，因此立即返回错误而不是死锁。
+var ErrReentrantLoad = singleflight.ErrReentrant
 
 // Go 函数类型 + 接口，**函数可以实现接口**，这个设计叫【函数适配器】
 // 定义一个函数类型
