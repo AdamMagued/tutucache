@@ -1,6 +1,7 @@
 package lru
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -140,6 +141,25 @@ func TestCleanupExpired(t *testing.T) {
 	}
 	if !reflect.DeepEqual([]string{"k1", "k2"}, keys) {
 		t.Fatalf("expire callback keys wrong")
+	}
+}
+
+func TestNewRejectsNegativeMaxBytes(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("New(-1) should panic, not silently evict every entry")
+		}
+	}()
+	New(-1, nil)
+}
+
+func TestZeroMaxBytesIsUnlimited(t *testing.T) {
+	c := New(Unlimited, nil)
+	for i := 0; i < 100; i++ {
+		c.Add(fmt.Sprintf("k%d", i), String("value"), 0)
+	}
+	if got := c.Len(); got != 100 {
+		t.Fatalf("len=%d, want 100 (0 means unlimited)", got)
 	}
 }
 

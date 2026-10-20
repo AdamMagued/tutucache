@@ -78,6 +78,11 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 	if getter == nil {
 		panic("nil Getter")
 	}
+	// cacheBytes 必须 >= 0：lru.Unlimited(0) 表示不限制内存，负数属于非法配置。
+	// 在构造期就 panic，避免配置错误让缓存静默失效或变成无界缓存。
+	if cacheBytes < 0 {
+		panic(fmt.Sprintf("geecache: cacheBytes for group %q must be >= 0 (0 means unlimited), got %d", name, cacheBytes))
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	m := NewMetrics()
