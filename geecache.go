@@ -199,13 +199,22 @@ func (g *Group) populateCache(key string, value ByteView) {
 	g.mainCache.add(key, value, g.DefaultTTL)
 }
 
-// SetTTL 设置默认过期时间并启动后台清理
-// cleanupInterval 为 0 时不启动后台清理（仅依赖 Get 时的惰性删除）
+// SetTTL 设置默认过期时间并启动后台清理。
+// cleanupInterval > 0 时，首次调用会启动一个后台清理循环；重复调用只更新
+// DefaultTTL，不会重复启动 goroutine，清理间隔以首次的非零值为准。
+// cleanupInterval 为 0 时不启动后台清理（仅依赖 Get 时的惰性删除）。
 func (g *Group) SetTTL(ttl time.Duration, cleanupInterval time.Duration) {
 	g.DefaultTTL = ttl
 	if cleanupInterval > 0 {
 		g.mainCache.StartCleanup(cleanupInterval)
 	}
+}
+
+// Close 停止 Group 的后台过期清理循环；可重复调用。
+// Close 不会把 Group 从全局注册表移除，也不会影响后续 Get 调用；
+// 但之后调用 SetTTL 不会再重新启动清理循环。
+func (g *Group) Close() {
+	g.mainCache.StopCleanup()
 }
 
 //cc

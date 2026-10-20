@@ -173,6 +173,8 @@ func main() {
 	if err := cacheSrv.Shutdown(ctx); err != nil {
 		log.Printf("cache server shutdown error: %v", err)
 	}
+	// 停止 Group 的后台清理循环（若通过 SetTTL 启动过）。
+	gee.Close()
 
 	log.Println("all servers stopped gracefully")
 }

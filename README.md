@@ -175,7 +175,8 @@ value, err := group.Get("user:123")
 | `GetGroup(name)` | 获取已创建的缓存组 |
 | `Get(key)` | 获取缓存值（自动处理 miss） |
 | `RegisterPeers(peers)` | 注册远程节点 |
-| `SetTTL(ttl, cleanupInterval)` | 设置默认过期时间，可选启动后台清理 |
+| `SetTTL(ttl, cleanupInterval)` | 设置默认过期时间；首次传入非零 `cleanupInterval` 时启动后台清理，重复调用不会重复启动 |
+| `Close()` | 停止后台清理循环（可重复调用），不影响已获取的缓存数据 |
 
 ### HTTPPool
 
