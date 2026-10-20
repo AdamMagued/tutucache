@@ -1,6 +1,7 @@
 package singleflight
 
 import (
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -152,5 +153,54 @@ func TestDoDeduplicatesAndSharesResult(t *testing.T) {
 	got := atomic.LoadInt32(&calls)
 	if got != 1 { // 校验：业务fn总共只执行1次（只有winner里面的fn运行）
 		t.Fatalf("fn ran %d times, want 1", got)
+	}
+}
+
+// 回归测试 #29：同一 goroutine 递归 Do 同一个 key 必须快速失败，不能死锁。
+func TestDoReentrantSameKeyFailsFast(t *testing.T) {
+	g := NewGroup()
+	type result struct {
+		val      interface{}
+		err      error
+		innerErr error
+	}
+	done := make(chan result, 1)
+
+	go func() {
+		var innerErr error
+		v, err := g.Do("k", func() (interface{}, error) {
+			_, innerErr = g.Do("k", func() (interface{}, error) { return nil, nil })
+			return "v", nil
+		})
+		done <- result{val: v, err: err, innerErr: innerErr}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("outer Do error = %v, want nil", r.err)
+		}
+		if r.val != "v" {
+			t.Fatalf("outer Do value = %v, want v", r.val)
+		}
+		if !errors.Is(r.innerErr, ErrReentrant) {
+			t.Fatalf("inner Do error = %v, want ErrReentrant", r.innerErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("re-entrant Do(k) deadlocked")
+	}
+}
+
+// 同一 goroutine 递归加载不同 key 是合法用法，不能被误判为 re-entrant。
+func TestDoNestedDifferentKeyAllowed(t *testing.T) {
+	g := NewGroup()
+	v, err := g.Do("a", func() (interface{}, error) {
+		return g.Do("b", func() (interface{}, error) { return "b", nil })
+	})
+	if err != nil {
+		t.Fatalf("Do(a) error = %v, want nil", err)
+	}
+	if v != "b" {
+		t.Fatalf("Do(a) value = %v, want b", v)
 	}
 }

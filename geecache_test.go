@@ -1,6 +1,7 @@
 package geecache
 
 import (
+	"errors"
 	"fmt"
 	pb "geecache/geecachepb"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNewGroupRejectsNegativeCacheBytes(t *testing.T) {
@@ -281,5 +283,59 @@ func TestGet(t *testing.T) {
 
 	if view, err := gee.Get("unknown"); err == nil {
 		t.Fatalf("the value of unknow should be empty, but %s got", view)
+	}
+}
+
+// 回归测试 #29：Getter 在加载 K 时递归调用 Get(K) 不能死锁，
+// 应立即返回 ErrReentrantLoad，并让外层调用正常结束。
+func TestReentrantGetterFailsFast(t *testing.T) {
+	var g *Group
+	g = NewGroup("reentrant-getter", 2<<10, GetterFunc(func(k string) ([]byte, error) {
+		if k == "K" {
+			v, err := g.Get("K")
+			if err != nil {
+				return nil, err
+			}
+			return v.ByteSlice(), nil
+		}
+		return []byte("v"), nil
+	}))
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := g.Get("K")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrReentrantLoad) {
+			t.Fatalf("Get(K) error = %v, want ErrReentrantLoad", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-entrant Getter deadlocked on Get(K)")
+	}
+}
+
+// Getter 递归加载不同的 key 是合法用法，不能被 re-entrant 检测误伤。
+func TestGetterCanLoadOtherKey(t *testing.T) {
+	var g *Group
+	g = NewGroup("nested-other-key", 2<<10, GetterFunc(func(k string) ([]byte, error) {
+		if k == "A" {
+			v, err := g.Get("B")
+			if err != nil {
+				return nil, err
+			}
+			return append([]byte("A:"), v.ByteSlice()...), nil
+		}
+		return []byte("B"), nil
+	}))
+
+	v, err := g.Get("A")
+	if err != nil {
+		t.Fatalf("Get(A) error = %v, want nil", err)
+	}
+	if got := v.String(); got != "A:B" {
+		t.Fatalf("Get(A) = %q, want %q", got, "A:B")
 	}
 }
